@@ -3,12 +3,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, date
 from typing import Literal
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from .db import Base, AuditEvent, audit, engine_for_env, uid
-from .security import current_actor
+from .security import current_actor, require_write
 from .model import *
 
 @asynccontextmanager
@@ -41,6 +41,8 @@ async def add_headers(request: Request, call_next):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     return response
 
 @app.get('/healthz', include_in_schema=False)
@@ -48,11 +50,14 @@ def healthz():
     return {'ok': True}
 
 @app.get('/v1/audit')
-def audit_list(auth=Depends(current_actor), session: Session=Depends(session_dep)):
+def audit_list(limit:int=Query(default=50,ge=1,le=100),offset:int=Query(default=0,ge=0,le=10000),
+               auth=Depends(current_actor),session: Session=Depends(session_dep)):
     rows = session.scalars(select(AuditEvent).where(AuditEvent.tenant_id == auth['tenant_id'])
-                           .order_by(AuditEvent.created_at.desc()).limit(100)).all()
-    return {'events': [{'kind': r.kind, 'resource_id': r.resource_id,
-                        'actor_id': r.actor_id, 'at': r.created_at.isoformat()} for r in rows]}
+                           .order_by(AuditEvent.created_at.desc(),AuditEvent.id.desc())
+                           .offset(offset).limit(limit)).all()
+    return {'events': [{'kind':r.kind,'resource_id':r.resource_id,'actor_id':r.actor_id,
+                        'at':r.created_at.isoformat()} for r in rows],
+            'limit':limit,'offset':offset}
 
 from sqlalchemy.exc import IntegrityError
 
@@ -66,7 +71,7 @@ class Transition(BaseModel):
     status: Literal['in_progress','completed','rejected']
 
 @app.post('/v1/requests',status_code=201)
-def create_rights_request(payload: NewRightsRequest,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+def create_rights_request(payload: NewRightsRequest,auth=Depends(require_write),session: Session=Depends(session_dep)):
     if payload.deadline_at.tzinfo is None:
         raise HTTPException(422,'A timezone-aware deadline is required')
     request=RightsRequest(tenant_id=auth['tenant_id'],external_ref=payload.external_ref,
@@ -86,7 +91,7 @@ def list_requests(auth=Depends(current_actor),session: Session=Depends(session_d
              'deadline_at':r.deadline_at.isoformat()} for r in rows]
 
 @app.post('/v1/requests/{request_id}/transition')
-def transition(request_id: str,payload: Transition,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+def transition(request_id: str,payload: Transition,auth=Depends(require_write),session: Session=Depends(session_dep)):
     request=require_tenant(session,RightsRequest,request_id,auth['tenant_id'])
     allowed={'received':{'in_progress'},'in_progress':{'completed','rejected'},'completed':set(),'rejected':set()}
     if payload.status not in allowed[request.status]:
@@ -94,3 +99,25 @@ def transition(request_id: str,payload: Transition,auth=Depends(current_actor),s
     request.status=payload.status;audit(session,auth,'rights_request.'+request.status,request.id);session.commit()
     return {'id':request.id,'status':request.status,
             'note':'Workflow tracking only. No data erasure or legal verification performed.'}
+
+@app.get('/v1/requests/summary')
+def rights_summary(within_days:int=Query(default=30,ge=1,le=365),
+                   auth=Depends(current_actor),session: Session=Depends(session_dep)):
+    requests=session.scalars(select(RightsRequest).where(RightsRequest.tenant_id==auth['tenant_id'])).all()
+    now=datetime.now(timezone.utc); due=now+timedelta(days=within_days)
+    counts={k:0 for k in ('received','in_progress','completed','rejected')}
+    overdue=soon=0
+    for item in requests:
+        counts[item.status]=counts.get(item.status,0)+1
+        if item.status in ('completed','rejected'):
+            continue
+        deadline=item.deadline_at
+        if deadline.tzinfo is None:
+            deadline=deadline.replace(tzinfo=timezone.utc)
+        if deadline<now:
+            overdue+=1
+        elif deadline<=due:
+            soon+=1
+    return {'total':len(requests),'by_status':counts,'overdue':overdue,
+            'due_soon':soon,'within_days':within_days,
+            'note':'Operational workflow counts, not an automated legal deadline assessment.'}
